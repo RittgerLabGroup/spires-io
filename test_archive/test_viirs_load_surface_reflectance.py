@@ -94,7 +94,8 @@ END
         data_fields_1km.create_dataset("land_water_mask_1", data=np.ones((1, 1), dtype=np.uint8))
         data_fields_1km.create_dataset("num_observations_1km", data=np.full((1, 1), 2, dtype=np.uint8))
 
-        data_fields_500m.create_dataset("iobs_res_1", data=scalar_500m)
+        # This fixture has first layers only; observation pointers are zero-based.
+        data_fields_500m.create_dataset("iobs_res_1", data=np.zeros_like(scalar_500m))
         data_fields_500m.create_dataset("num_observations_500m", data=np.full((2, 2), 2, dtype=np.uint8))
         data_fields_500m.create_dataset("obscov_500m_1", data=np.zeros((2, 2), dtype=np.uint16))
 
@@ -134,7 +135,7 @@ def build_mock_viirs_raw_dataset():
             "num_observations_1km": qa_1km.copy() + 2,
             "obscov_1km": qa_1km.copy(),
             "orbit_pnt": qa_1km.copy(),
-            "iobs_res": scalar_500m.copy(),
+            "iobs_res": xr.zeros_like(scalar_500m),
             "num_observations_500m": scalar_500m.copy() + 2,
             "obscov_500m": scalar_500m.copy(),
         },
@@ -257,7 +258,7 @@ def test_prepare_viirs_scene_for_inversion_keeps_water_valid_for_r0():
     raw = build_mock_viirs_raw_dataset()
     raw["land_water_mask"] = xr.zeros_like(raw["land_water_mask"])
 
-    ds = prepare_viirs_scene_for_inversion(raw)
+    ds = prepare_viirs_scene_for_inversion(raw, keep_r0_masks=True)
 
     assert bool(ds["mask_water"].all())
     assert not bool(ds["valid_inversion_mask"].any())
@@ -268,7 +269,7 @@ def test_prepare_viirs_scene_for_inversion_treats_deep_ocean_as_water():
     raw = build_mock_viirs_raw_dataset()
     raw["land_water_mask"] = xr.full_like(raw["land_water_mask"], 7)
 
-    ds = prepare_viirs_scene_for_inversion(raw)
+    ds = prepare_viirs_scene_for_inversion(raw, keep_r0_masks=True)
 
     assert bool(ds["mask_water"].all())
     assert not bool(ds["valid_inversion_mask"].any())

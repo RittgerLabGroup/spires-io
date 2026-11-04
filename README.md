@@ -326,3 +326,17 @@ Reprojection uses rioxarray's required `(band, y, x)` layout and returns the
 canonical SPIReS `(y, x, band)` layout. A failed geospatial reprojection now raises
 an error instead of silently relabeling a georeferenced array. Positional,
 unreferenced backgrounds retain their existing compatibility path.
+
+### Matched VIIRS observations and NRT products
+
+The VIIRS reader preserves first-layer native grids and exposes `matched_*`
+M-band reflectance, geometry and QA selected for each first-I observation through
+`iobs_res_1`. Nonzero pointers resolve the compact additional-observation arrays;
+invalid pointers remain unavailable and malformed/missing compact fields fail.
+Scene preparation uses those matched values for inversion and R0 eligibility.
+
+Standard and `_NRT` VNP09GA/VJ109GA/VJ209GA names are accepted without renaming.
+The original product name and processing timestamp remain in scene metadata;
+`source_stream` is `standard` or `nrt`. A downloaded NOAA-20 NRT Collection 2 sample
+was checked against compact M2 and QF7 indexing. Broader NRT scientific comparison
+and source-replacement policy belong to operational validation and orchestration.
