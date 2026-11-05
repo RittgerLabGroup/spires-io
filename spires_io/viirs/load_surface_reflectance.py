@@ -47,7 +47,7 @@ from spires_io.viirs.qa import decode_viirs_qa_masks, load_external_cloud_masks
 
 
 VIIRS_FILENAME_RE = re.compile(
-    r"^(?P<product>VNP09GA|VJ109GA|VJ209GA)\.A(?P<year>\d{4})(?P<doy>\d{3})\."
+    r"^(?P<product>(?:VNP09GA|VJ109GA|VJ209GA)(?:_NRT)?)\.A(?P<year>\d{4})(?P<doy>\d{3})\."
     r"(?P<tile>h\d{2}v\d{2})\.(?P<collection>\d{3})\.(?P<processing>\d+)\.h5$"
 )
 
@@ -58,6 +58,8 @@ PLATFORM_BY_PRODUCT = {
 }
 
 LOGGER = logging.getLogger(__name__)
+
+VIIRS_OBSERVATION_SELECTION = "first I observation; M bands, geometry and QA selected by iobs_res_1"
 
 
 def parse_viirs_surface_reflectance_filename(path: str | Path) -> SceneMetadata:
@@ -74,7 +76,7 @@ def parse_viirs_surface_reflectance_filename(path: str | Path) -> SceneMetadata:
 
     return SceneMetadata(
         product=product,
-        platform=PLATFORM_BY_PRODUCT[product],
+        platform=PLATFORM_BY_PRODUCT[product.removesuffix("_NRT")],
         tile=match.group("tile"),
         acquisition_date=acquisition_date,
         collection=match.group("collection"),
@@ -143,6 +145,107 @@ def _open_scalar_fields(
     return result
 
 
+def _match_first_i_observation(
+    raw: xr.Dataset,
+    hdf: h5py.File | None = None,
+) -> dict[str, xr.DataArray]:
+    """Match 1 km fields to each first I observation on the native 500 m grid.
+
+    iobs_res is zero-based: 0 selects the first 1 km layer, while p > 0
+    selects compact[start_of_cell + p - 1]. Compact records are stored at
+    the HDF root, in row-major cell order, with num_observations - 1 extras
+    per cell. Never substitute the first layer for a missing match.
+    """
+    counts = np.asarray(raw["num_observations_1km"].values)
+    fine_counts = np.asarray(raw["num_observations_500m"].values)
+    pointer = np.asarray(raw["iobs_res"].values)
+    fine_shape = (2 * counts.shape[0], 2 * counts.shape[1])
+    if pointer.shape != fine_shape or fine_counts.shape != fine_shape:
+        raise ValueError("VIIRS observation grids must have the native 2:1 spatial relationship")
+
+    # Counts are signed bytes with fill -1; permit NaN-decoded inputs too.
+    counts = np.where(np.isfinite(counts) & (counts >= 0) & (counts <= 127), counts, 0).astype(np.int64)
+    valid = (
+        np.isfinite(pointer)
+        & (pointer >= 0)
+        & (pointer <= 254)
+        & (pointer == np.floor(pointer))
+        & (pointer < _upsample_1km_array_to_500m(counts))
+        & np.isfinite(fine_counts)
+        & (fine_counts > 0)
+        & (fine_counts <= 127)
+    )
+    rows, cols = np.nonzero(valid & (pointer > 0))
+    additional_count = 0
+    compact_index = np.empty(0, dtype=np.int64)
+    if rows.size:
+        if hdf is None:
+            raise ValueError(
+                "VIIRS iobs_res requires additional 1 km observations. "
+                "Reopen the original HDF with open_viirs_surface_reflectance; "
+                "a first-layer-only Dataset cannot supply matched M bands, geometry or QA."
+            )
+        extra = np.maximum(counts - 1, 0)
+        starts = (np.cumsum(extra.ravel()) - extra.ravel()).reshape(counts.shape)
+        additional_count = int(extra.sum())
+        if "TotalAdditionalObservations1KM" in hdf.attrs:
+            if int(hdf.attrs["TotalAdditionalObservations1KM"]) != additional_count:
+                raise ValueError("VIIRS compact observation count disagrees with num_observations_1km")
+        if "nadd_obs_row_1km" in hdf:
+            if not np.array_equal(hdf["nadd_obs_row_1km"][:], extra.sum(axis=1)):
+                raise ValueError("VIIRS compact row counts disagree with num_observations_1km")
+        compact_index = starts[rows // 2, cols // 2] + pointer[rows, cols].astype(np.int64) - 1
+
+    def select(first: np.ndarray, field: str, *, physical: bool) -> np.ndarray:
+        array = _upsample_1km_array_to_500m(first)
+        if rows.size:
+            compact_name = field.removesuffix("_1") + "_c"
+            if compact_name not in hdf:
+                raise ValueError(f"VIIRS observation matching requires missing compact field {compact_name!r}")
+            compact = hdf[compact_name]
+            if compact.shape != (additional_count,):
+                raise ValueError(f"Invalid VIIRS compact field shape for {compact_name!r}: {compact.shape}")
+            values = read_scaled_array(
+                compact, apply_scale=physical, mask_fill=physical, mask_valid_range=physical,
+            )
+            array[rows, cols] = values[compact_index]
+        if physical:
+            array = array.astype(np.float32, copy=False)
+            array[~valid] = np.nan
+        else:
+            # Preserve integer QA for bit decoding. Invalid matches are also
+            # excluded by NaN reflectance/geometry, independently of QA bits.
+            fill = np.iinfo(array.dtype).max if np.issubdtype(array.dtype, np.integer) else np.nan
+            array[~valid] = fill
+        return array
+
+    coords = {"y_500m": raw["y_500m"].values, "x_500m": raw["x_500m"].values}
+    dims = ("y_500m", "x_500m")
+    bands = raw["band_1km"].values
+    spectra = np.empty((*fine_shape, len(bands)), dtype=np.float32)
+    for i, band in enumerate(bands):
+        spectra[..., i] = select(
+            raw["reflectance_1km"].values[..., i], reflectance_field_name(str(band)), physical=True,
+        )
+    attrs = {**raw["reflectance_1km"].attrs, "observation_selection": VIIRS_OBSERVATION_SELECTION}
+    result = {
+        "reflectance_1km": xr.DataArray(
+            spectra, dims=(*dims, "band_1km"), coords={**coords, "band_1km": bands}, attrs=attrs,
+        ),
+        "observation_valid": xr.DataArray(valid, dims=dims, coords=coords),
+    }
+    fields = {**VIIRS_1KM_GEOMETRY_FIELDS, **VIIRS_1KM_QA_FIELDS}
+    for name, field in fields.items():
+        if name == "num_observations_1km":
+            continue  # This is a cell count, not an observation-specific field.
+        result[name] = xr.DataArray(
+            select(raw[name].values, field, physical=name in VIIRS_1KM_GEOMETRY_FIELDS),
+            dims=dims, coords=coords,
+            attrs={**raw[name].attrs, "observation_selection": VIIRS_OBSERVATION_SELECTION},
+        )
+    return result
+
+
 def open_viirs_surface_reflectance(
     path: str | Path,
     *,
@@ -153,9 +256,14 @@ def open_viirs_surface_reflectance(
     """
     Open a single VIIRS VNP09GA, VJ109GA, or VJ209GA file as a normalized xarray dataset.
 
-    The first version intentionally preserves the native split-grid structure:
+    Preserve the native first-layer split-grid structure:
     - 1 km moderate-band reflectance, geometry, and QA layers
     - 500 m imagery-band reflectance and support layers
+
+    Additional ``matched_*`` variables hold M reflectance, geometry and QA
+    on the 500 m grid, selected using each first I observation's iobs_res_1.
+    Invalid pointers have no usable match. Required missing or malformed
+    compact data raise ValueError rather than falling back to the first layer.
 
     Parameters
     ----------
@@ -287,6 +395,10 @@ def open_viirs_surface_reflectance(
             )
         ds["reflectance_1km"].attrs.update(grid_metadata_1km.to_attrs())
         ds["reflectance_500m"].attrs.update(grid_metadata_500m.to_attrs())
+        ds.update({f"matched_{name}": value for name, value in _match_first_i_observation(ds, hdf).items()})
+        ds["matched_reflectance_1km"].attrs.update(grid_metadata_500m.to_attrs())
+        ds.attrs["viirs_observation_selection"] = VIIRS_OBSERVATION_SELECTION
+        ds.attrs["source_stream"] = "nrt" if scene.product.endswith("_NRT") else "standard"
         ds.attrs["selected_bands"] = selected_bands
         ds.attrs["band_selection_source"] = band_selection_source
         if lut_file is not None:
@@ -297,7 +409,7 @@ def open_viirs_surface_reflectance(
             x_dim="x_500m",
             y_dim="y_500m",
             grid_metadata=grid_metadata_500m,
-            data_var_names=("reflectance_500m",),
+            data_var_names=("reflectance_500m", *(name for name in ds.data_vars if name.startswith("matched_"))),
         )
 
     log_event(
@@ -539,6 +651,10 @@ def prepare_viirs_scene_for_inversion(
     """
     Prepare a VIIRS scene on a single 500 m analysis grid for downstream inversion.
 
+    Retain the first I observation and use its iobs_res_1 pointer to select
+    the M bands, geometry and QA. Invalid matches are excluded from both
+    inversion and R0 eligibility; observations are not re-ranked.
+
     Parameters
     ----------
     source
@@ -627,15 +743,31 @@ def prepare_viirs_scene_for_inversion(
     x = raw["x_500m"]
     y = raw["y_500m"]
 
-    moderate_500m = _upsample_1km_dataarray_to_500m(raw["reflectance_1km"], target_x=x, target_y=y)
+    match_names = (
+        "reflectance_1km", "observation_valid", *VIIRS_1KM_GEOMETRY_FIELDS,
+        *(name for name in VIIRS_1KM_QA_FIELDS if name != "num_observations_1km"),
+    )
+    if any(f"matched_{name}" in raw for name in match_names):
+        missing = [name for name in match_names if f"matched_{name}" not in raw]
+        if missing:
+            raise ValueError(f"Incomplete VIIRS matched observations: missing {missing}")
+        matched = {name: raw[f"matched_{name}"] for name in match_names}
+    else:
+        # Hand-built or older raw Datasets remain usable when every valid
+        # pointer selects layer zero. Nonzero pointers require the source HDF.
+        matched = _match_first_i_observation(raw)
+    matched = {name: _normalize_500m_dataarray(value) for name, value in matched.items()}
+    moderate_500m = matched["reflectance_1km"]
     moderate_500m = moderate_500m.rename({"band_1km": "band"})
     imagery_500m = _normalize_500m_dataarray(raw["reflectance_500m"])
 
     merged_reflectance = xr.concat([imagery_500m, moderate_500m], dim="band")
     merged_reflectance = merged_reflectance.sel(band=bands).transpose("y", "x", "band")
+    merged_reflectance = merged_reflectance.where(matched["observation_valid"])
     merged_reflectance.name = "reflectance"
     merged_reflectance.attrs["analysis_grid"] = "500m"
-    merged_reflectance.attrs["resampling_1km_to_500m"] = "nearest"
+    merged_reflectance.attrs["resampling_1km_to_500m"] = "native parent cell, observation selected by iobs_res_1"
+    merged_reflectance.attrs["observation_selection"] = VIIRS_OBSERVATION_SELECTION
 
     prepared_data_vars = {
         "reflectance": merged_reflectance,
@@ -665,13 +797,16 @@ def prepare_viirs_scene_for_inversion(
         "orbit_pnt",
     ]
     for variable_name in fields_1km_to_expand:
-        prepared[variable_name] = _upsample_1km_dataarray_to_500m(raw[variable_name], target_x=x, target_y=y)
+        prepared[variable_name] = (
+            _upsample_1km_dataarray_to_500m(raw[variable_name], target_x=x, target_y=y)
+            if variable_name == "num_observations_1km" else matched[variable_name]
+        )
 
     for variable_name in ("iobs_res", "num_observations_500m", "obscov_500m"):
         prepared[variable_name] = _normalize_500m_dataarray(raw[variable_name])
 
     qa_500m = {
-        name: _upsample_1km_dataarray_to_500m(raw[name], target_x=x, target_y=y)
+        name: matched[name]
         for name in ("qa_qf1", "qa_qf2", "qa_qf3", "qa_qf4", "qa_qf5", "qa_qf7")
     }
     qa_mask_ds = decode_viirs_qa_masks(
@@ -777,6 +912,7 @@ def prepare_viirs_scene_for_inversion(
     )
     prepared.update(mask_ds)
     prepared.attrs["cloud_mask_source_policy"] = resolved_cloud_mask_source_policy
+    prepared.attrs["viirs_observation_selection"] = VIIRS_OBSERVATION_SELECTION
     prepared.attrs["cloud_mask_application_stage"] = cloud_mask_application_stage
     prepared = _drop_component_masks(
         prepared,
